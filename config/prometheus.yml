@@ -1,0 +1,58 @@
+# ============================================================================
+# Prometheus Configuration for RoyalAudit Digitizer
+# ============================================================================
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: "production"
+    service: "royalaudit-digitizer"
+
+# ============================================================================
+# Alerting Configuration
+# ============================================================================
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+# ============================================================================
+# Rule Files
+# ============================================================================
+rule_files: []
+
+# ============================================================================
+# Scrape Configuration
+# ============================================================================
+scrape_configs:
+  # --------------------------------------------------------------------------
+  # Self-monitoring
+  # --------------------------------------------------------------------------
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # --------------------------------------------------------------------------
+  # RoyalAudit API Metrics
+  # --------------------------------------------------------------------------
+  - job_name: "royalaudit-api"
+    scrape_interval: 10s
+    static_configs:
+      - targets: ["api:9090"]
+    metrics_path: /metrics
+    scheme: http
+    relabel_configs:
+      - source_labels: [__address__]
+        target_label: instance
+        regex: "(.*):(.*)"
+        replacement: "royalaudit-api"
+
+  # --------------------------------------------------------------------------
+  # Redis Metrics (if redis-exporter is added)
+  # --------------------------------------------------------------------------
+  - job_name: "redis"
+    static_configs:
+      - targets: ["redis:6379"]
+    metrics_path: /metrics
+    scheme: http

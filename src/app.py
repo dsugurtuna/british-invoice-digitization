@@ -1,19 +1,12 @@
 import streamlit as st
-import torch
+import requests
 from PIL import Image
-import numpy as np
-import pandas as pd
+import io
 import os
-import sys
+import pandas as pd
 
-# Add current directory to path to import inference module
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-# Mock import if inference.py dependencies are missing in this specific env
-try:
-    from inference import InvoiceDigitizer
-except ImportError:
-    st.error("Could not import InvoiceDigitizer. Ensure requirements are installed.")
+# Configuration
+API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 st.set_page_config(page_title="RoyalAudit Digitizer", page_icon="🇬🇧", layout="wide")
 
@@ -21,33 +14,73 @@ st.title("🇬🇧 RoyalAudit Digitizer Dashboard")
 st.markdown("""
 **Client:** UK Digital Audit Solutions Ltd.  
 **System:** Automated Invoice Field Extraction  
+**Status:** Production Ready
 """)
 
+# Sidebar
 st.sidebar.header("Configuration")
-confidence_threshold = st.sidebar.slider("Confidence Threshold", 0.0, 1.0, 0.4, 0.05)
-model_path = st.sidebar.text_input("Model Path", "../models/royal_audit_v1_best.pt")
+api_status = "🔴 Offline"
+try:
+    r = requests.get(f"{API_URL}/health/live", timeout=2)
+    if r.status_code == 200:
+        api_status = "🟢 Online"
+except:
+    pass
+st.sidebar.write(f"API Status: {api_status}")
+st.sidebar.write(f"API URL: `{API_URL}`")
 
 uploaded_file = st.file_uploader("Upload Invoice Scan", type=['jpg', 'png', 'jpeg'])
 
 if uploaded_file is not None:
+    # Display image
     image = Image.open(uploaded_file)
     st.image(image, caption='Uploaded Invoice', use_column_width=True)
     
     if st.button("Analyze Invoice"):
-        with st.spinner("Processing with YOLOv5x..."):
-            try:
-                # Initialize model (caching this in production would be better)
-                if not os.path.exists(model_path):
-                    st.warning("Model file not found. Using dummy data for demonstration.")
-                    # Dummy data for demo purposes if model isn't trained yet
-                    detections = [
-                        {"label": "Total Amount", "confidence": 0.98, "value": "£1,250.00"},
-                        {"label": "Invoice Date", "confidence": 0.95, "value": "12/05/1998"},
-                        {"label": "Vendor Name", "confidence": 0.92, "value": "British Telecom"},
-                        {"label": "VAT Amount", "confidence": 0.89, "value": "£218.75"}
-                    ]
-                    st.success("Analysis Complete (Simulation)")
-                else:
+        if api_status == "🔴 Offline":
+            st.error("API is offline. Please start the backend service.")
+        else:
+            with st.spinner("Processing with YOLOv5x..."):
+                try:
+                    # Prepare file for upload
+                    img_byte_arr = io.BytesIO()
+                    image.save(img_byte_arr, format=image.format)
+                    img_byte_arr = img_byte_arr.getvalue()
+                    
+                    files = {'file': ('invoice.jpg', img_byte_arr, 'image/jpeg')}
+                    
+                    # Call API
+                    response = requests.post(f"{API_URL}/detect", files=files)
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        data = result.get("data", {})
+                        detections = data.get("detections", [])
+                        
+                        st.success(f"Analysis Complete. Found {len(detections)} fields.")
+                        
+                        # Display results in a table
+                        if detections:
+                            df = pd.DataFrame(detections)
+                            # Select relevant columns
+                            cols = ["class_name", "confidence"]
+                            if "text" in df.columns:
+                                cols.append("text")
+                            
+                            st.dataframe(df[cols].style.format({"confidence": "{:.2%}"}))
+                            
+                            # JSON view
+                            with st.expander("View Raw JSON"):
+                                st.json(result)
+                        else:
+                            st.info("No fields detected.")
+                            
+                    else:
+                        st.error(f"Error: {response.status_code} - {response.text}")
+                        
+                except Exception as e:
+                    st.error(f"An error occurred: {str(e)}")
+
                     digitizer = InvoiceDigitizer(model_path=model_path, conf_thres=confidence_threshold)
                     # Convert PIL to numpy for the inference class
                     img_np = np.array(image)

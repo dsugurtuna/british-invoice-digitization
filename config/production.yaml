@@ -1,0 +1,30 @@
+# Production Configuration Override
+# Inherits from default.yaml, only override production-specific settings
+
+app:
+  environment: "production"
+  debug: false
+  log_level: "WARNING"
+
+model:
+  device: "cuda"
+  half_precision: true
+
+api:
+  workers: 8
+  reload: false
+  rate_limit:
+    enabled: true
+    requests_per_minute: 120
+
+monitoring:
+  prometheus:
+    enabled: true
+  logging:
+    format: "json"
+
+security:
+  api_key:
+    enabled: true
+  validation:
+    strict_mode: true

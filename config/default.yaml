@@ -1,0 +1,233 @@
+# ============================================================================
+# RoyalAudit Digitizer - Configuration
+# ============================================================================
+# Application settings with environment variable support
+# Override any setting via environment variables prefixed with ROYALAUDIT_
+
+app:
+  name: "RoyalAudit Digitizer"
+  version: "2.0.0"
+  environment: "development"  # development | staging | production
+  debug: false
+  log_level: "INFO"  # DEBUG | INFO | WARNING | ERROR | CRITICAL
+
+# ============================================================================
+# Model Configuration
+# ============================================================================
+model:
+  # YOLOv5 Model Settings
+  architecture: "yolov5x"  # yolov5n | yolov5s | yolov5m | yolov5l | yolov5x
+  weights_path: "models/royal_audit_v2_best.pt"
+  fallback_weights: "yolov5x.pt"  # Auto-download from Ultralytics if custom weights missing
+  
+  # Inference Settings
+  confidence_threshold: 0.4
+  iou_threshold: 0.45  # NMS IoU threshold
+  max_detections: 100
+  image_size: 640  # Inference image size (pixels)
+  
+  # Device Configuration
+  device: "auto"  # auto | cpu | cuda | cuda:0 | mps
+  half_precision: true  # FP16 inference (requires CUDA)
+  
+  # Class Labels (6 invoice field types)
+  classes:
+    - "Invoice Date"
+    - "Invoice Number"
+    - "Vendor Name"
+    - "Total Amount"
+    - "VAT Amount"
+    - "Line Item"
+
+# ============================================================================
+# Preprocessing Configuration
+# ============================================================================
+preprocessing:
+  # Image preprocessing settings
+  auto_orient: true  # Auto-rotate based on EXIF
+  normalize: true
+  
+  # Supported formats
+  supported_formats:
+    - ".jpg"
+    - ".jpeg"
+    - ".png"
+    - ".tiff"
+    - ".tif"
+    - ".bmp"
+    - ".webp"
+    - ".pdf"  # PDF support via pdf2image
+  
+  # Size limits
+  max_file_size_mb: 50
+  max_image_dimension: 4096
+  
+  # Enhancement options
+  enhance:
+    enabled: true
+    denoise: true
+    sharpen: false
+    contrast_adjustment: 1.1
+
+# ============================================================================
+# OCR Configuration (Post-detection text extraction)
+# ============================================================================
+ocr:
+  enabled: true
+  engine: "easyocr"  # easyocr | tesseract | google_vision | aws_textract
+  languages:
+    - "en"
+  confidence_threshold: 0.6
+  
+  # Tesseract-specific settings
+  tesseract:
+    psm: 6  # Page segmentation mode
+    oem: 3  # OCR Engine mode
+  
+  # EasyOCR-specific settings
+  easyocr:
+    gpu: true
+    batch_size: 4
+
+# ============================================================================
+# API Server Configuration
+# ============================================================================
+api:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  reload: false  # Hot reload (development only)
+  
+  # Request limits
+  max_upload_size_mb: 100
+  request_timeout_seconds: 300
+  
+  # Rate limiting
+  rate_limit:
+    enabled: true
+    requests_per_minute: 60
+    burst: 10
+  
+  # CORS settings
+  cors:
+    enabled: true
+    allow_origins:
+      - "*"
+    allow_methods:
+      - "GET"
+      - "POST"
+      - "OPTIONS"
+    allow_headers:
+      - "*"
+
+# ============================================================================
+# Batch Processing Configuration
+# ============================================================================
+batch:
+  enabled: true
+  max_concurrent_jobs: 4
+  max_queue_size: 100
+  job_timeout_seconds: 3600
+  
+  # Output settings
+  output_format: "json"  # json | csv | xml
+  include_visualizations: true
+  
+  # Storage
+  storage:
+    type: "local"  # local | s3 | gcs | azure_blob
+    local_path: "./output/batch_results"
+    retention_days: 30
+
+# ============================================================================
+# Monitoring & Observability
+# ============================================================================
+monitoring:
+  # Prometheus metrics
+  prometheus:
+    enabled: true
+    port: 9090
+    path: "/metrics"
+  
+  # Structured logging
+  logging:
+    format: "json"  # json | console
+    include_request_id: true
+    include_trace_id: true
+  
+  # Health checks
+  health:
+    enabled: true
+    path: "/health"
+    include_details: true
+
+# ============================================================================
+# Training Configuration
+# ============================================================================
+training:
+  # Data paths
+  data_dir: "./data"
+  train_path: "./data/train/images"
+  val_path: "./data/valid/images"
+  test_path: "./data/test/images"
+  
+  # Training hyperparameters
+  hyperparameters:
+    epochs: 100
+    batch_size: 16
+    image_size: 640
+    learning_rate: 0.01
+    momentum: 0.937
+    weight_decay: 0.0005
+    warmup_epochs: 3
+    
+  # Augmentation
+  augmentation:
+    mosaic: 1.0
+    mixup: 0.0
+    hsv_h: 0.015
+    hsv_s: 0.7
+    hsv_v: 0.4
+    degrees: 0.0
+    translate: 0.1
+    scale: 0.5
+    shear: 0.0
+    perspective: 0.0
+    flipud: 0.0
+    fliplr: 0.5
+  
+  # Callbacks
+  callbacks:
+    save_period: 10
+    early_stopping:
+      enabled: true
+      patience: 20
+      min_delta: 0.001
+    
+  # Experiment tracking
+  experiment_tracking:
+    enabled: false
+    platform: "mlflow"  # mlflow | wandb | tensorboard
+    project_name: "royalaudit-digitizer"
+    run_name: null  # Auto-generated if null
+
+# ============================================================================
+# Security Configuration
+# ============================================================================
+security:
+  # API authentication
+  api_key:
+    enabled: false
+    header_name: "X-API-Key"
+  
+  # Input validation
+  validation:
+    strict_mode: true
+    sanitize_filenames: true
+    scan_for_malware: false  # Requires ClamAV
+  
+  # Data privacy
+  privacy:
+    anonymize_logs: true
+    redact_pii: false
+    retention_policy_days: 90
