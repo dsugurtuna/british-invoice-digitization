@@ -1,405 +1,334 @@
-"""API routes for invoice digitization."""
+"""HTTP endpoints.
+
+Reading is open; changing the running service is not. Endpoints that alter
+thresholds or reload the model need the admin key, and are switched off when no
+key is configured.
+"""
 
 from __future__ import annotations
 
-import io
+import asyncio
+import secrets
 import time
-from typing import TYPE_CHECKING, Annotated, Any
-from uuid import uuid4
 
-import structlog
-from fastapi import APIRouter, Depends, File, HTTPException, Query, Request, UploadFile, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from typing import Annotated, Any
+from uuid import UUID
+
 import numpy as np
-from PIL import Image
+import structlog
 
+from fastapi import APIRouter, Depends, File, Header, HTTPException, Query, Request, UploadFile
+from fastapi import status as http_status
+from fastapi.responses import JSONResponse
+
+from invoice_digitizer._version import __version__
+from invoice_digitizer.api.metrics import INFERENCE_COUNT, INFERENCE_LATENCY
+from invoice_digitizer.config.settings import Settings
 from invoice_digitizer.core.digitizer import InvoiceDigitizer
+from invoice_digitizer.core.images import ImageValidationError, decode_image_bytes
+from invoice_digitizer.core.model_manager import ModelManager
 from invoice_digitizer.schemas.detection import DetectionResult
-from invoice_digitizer.schemas.request import BatchProcessRequest, InferenceRequest, ModelConfigRequest
+from invoice_digitizer.schemas.request import ModelConfigRequest
 from invoice_digitizer.schemas.response import (
-    APIResponse,
     BatchJobStatus,
     BatchProcessResponse,
     ComponentHealth,
     ErrorDetail,
-    ErrorResponse,
     HealthResponse,
     HealthStatus,
     InferenceResponse,
+    ModelConfigResponse,
     ResponseStatus,
 )
 
-if TYPE_CHECKING:
-    from invoice_digitizer.config.settings import Settings
-
 logger = structlog.get_logger(__name__)
 
-router = APIRouter(tags=["Invoice Digitization"])
+router = APIRouter()
+
+ALLOWED_CONTENT_TYPES = frozenset(
+    {"image/jpeg", "image/png", "image/tiff", "image/bmp", "image/webp"}
+)
+
+ConfidenceQuery = Annotated[
+    float | None, Query(ge=0.0, le=1.0, description="Override the confidence threshold")
+]
+IouQuery = Annotated[
+    float | None, Query(ge=0.0, le=1.0, description="Override the NMS IoU threshold")
+]
 
 
-# Dependency injection
-def get_settings(request: Request) -> "Settings":
-    """Get settings from app state."""
-    return request.app.state.settings
+# ---------------------------------------------------------------------------
+# Dependencies
+# ---------------------------------------------------------------------------
+
+
+def get_app_settings(request: Request) -> Settings:
+    """Settings attached to the app when it was created."""
+    settings: Settings = request.app.state.settings
+    return settings
 
 
 def get_digitizer(request: Request) -> InvoiceDigitizer:
-    """Get or create digitizer instance."""
-    if not hasattr(request.app.state, "digitizer"):
-        request.app.state.digitizer = InvoiceDigitizer(request.app.state.settings)
-    return request.app.state.digitizer
+    """The app's shared digitizer."""
+    digitizer: InvoiceDigitizer = request.app.state.digitizer
+    return digitizer
 
 
-# ============================================================================
-# Health Check Endpoints
-# ============================================================================
+def get_model_manager(request: Request) -> ModelManager:
+    """The app's shared model manager."""
+    manager: ModelManager = request.app.state.model_manager
+    return manager
 
 
-@router.get(
-    "/health",
-    response_model=HealthResponse,
-    summary="Health Check",
-    description="Check the health status of the API and its components.",
-)
-async def health_check(request: Request) -> HealthResponse:
-    """Perform health check on all components."""
-    components = []
-    overall_status = HealthStatus.HEALTHY
+def require_admin(
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    x_admin_key: Annotated[str | None, Header()] = None,
+) -> None:
+    """Allow the request only with the configured admin key."""
+    configured = settings.api.admin_api_key
+    if configured is None:
+        raise HTTPException(
+            status_code=http_status.HTTP_403_FORBIDDEN,
+            detail="Admin endpoints are disabled. Set INVOICE_DIGITIZER_API__ADMIN_API_KEY.",
+        )
+    supplied = (x_admin_key or "").encode()
+    if not secrets.compare_digest(supplied, configured.get_secret_value().encode()):
+        raise HTTPException(
+            status_code=http_status.HTTP_401_UNAUTHORIZED, detail="Missing or wrong admin key."
+        )
 
-    # Check model
+
+def _request_id(request: Request) -> UUID:
+    return UUID(request.state.request_id)
+
+
+async def _read_upload(upload: UploadFile, settings: Settings) -> np.ndarray:
+    """Check type and size, then decode. Raises HTTPException with a client error."""
+    if upload.content_type not in ALLOWED_CONTENT_TYPES:
+        raise HTTPException(
+            status_code=http_status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported file type: {upload.content_type}",
+        )
+    limit = settings.preprocessing.max_file_size_mb * 1024 * 1024
+    contents = await upload.read(limit + 1)  # read at most one byte past the limit
+    if len(contents) > limit:
+        raise HTTPException(
+            status_code=413,  # Content Too Large (constant name differs across Starlette versions)
+            detail=f"File is larger than {settings.preprocessing.max_file_size_mb} MB.",
+        )
     try:
-        model_manager = request.app.state.model_manager
-        model_info = model_manager.get_model_info()
-        components.append(
-            ComponentHealth(
-                name="ml_model",
-                status=HealthStatus.HEALTHY,
-                message=f"Model loaded: {model_info['architecture']}",
-            )
-        )
-    except Exception as e:
-        components.append(
-            ComponentHealth(
-                name="ml_model",
-                status=HealthStatus.UNHEALTHY,
-                message=str(e),
-            )
-        )
-        overall_status = HealthStatus.UNHEALTHY
+        return decode_image_bytes(contents, settings.preprocessing)
+    except ImageValidationError as exc:
+        raise HTTPException(status_code=http_status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
-    # Calculate uptime
-    uptime = time.time() - request.app.state.start_time
 
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
+
+
+@router.get("/health", response_model=HealthResponse, tags=["health"])
+async def health_check(
+    request: Request, manager: Annotated[ModelManager, Depends(get_model_manager)]
+) -> HealthResponse:
+    """Service health. Degraded until the model is in memory."""
+    info = manager.info()
+    if info["loaded"]:
+        model = ComponentHealth(
+            name="ml_model", status=HealthStatus.HEALTHY, message=f"Loaded: {info['version']}"
+        )
+    else:
+        model = ComponentHealth(
+            name="ml_model", status=HealthStatus.DEGRADED, message="Model not loaded yet"
+        )
     return HealthResponse(
-        status=overall_status,
-        version="2.0.0",
-        uptime_seconds=uptime,
-        components=components,
+        status=model.status,
+        version=__version__,
+        uptime_seconds=max(0.0, time.time() - request.app.state.started_at),
+        components=[model],
     )
 
 
-@router.get(
-    "/health/ready",
-    summary="Readiness Check",
-    description="Check if the API is ready to accept requests.",
-)
-async def readiness_check(request: Request) -> JSONResponse:
-    """Kubernetes readiness probe endpoint."""
-    try:
-        # Verify model is loaded and responsive
-        model_manager = request.app.state.model_manager
-        _ = model_manager.model
-        return JSONResponse(content={"status": "ready"}, status_code=200)
-    except Exception:
-        return JSONResponse(content={"status": "not_ready"}, status_code=503)
+@router.get("/health/ready", tags=["health"])
+async def readiness_check(
+    manager: Annotated[ModelManager, Depends(get_model_manager)],
+) -> JSONResponse:
+    """Ready means the model is in memory. Does not trigger a load."""
+    if manager.is_loaded:
+        return JSONResponse({"status": "ready"})
+    return JSONResponse(
+        {"status": "not_ready"}, status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE
+    )
 
 
-@router.get(
-    "/health/live",
-    summary="Liveness Check",
-    description="Check if the API process is alive.",
-)
-async def liveness_check() -> JSONResponse:
-    """Kubernetes liveness probe endpoint."""
-    return JSONResponse(content={"status": "alive"}, status_code=200)
+@router.get("/health/live", tags=["health"])
+async def liveness_check() -> dict[str, str]:
+    """The process is up and serving HTTP."""
+    return {"status": "alive"}
 
 
-# ============================================================================
-# Inference Endpoints
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Inference
+# ---------------------------------------------------------------------------
 
 
-@router.post(
-    "/api/v1/inference",
-    response_model=InferenceResponse,
-    summary="Process Invoice",
-    description="""
-Process a single invoice image and extract structured field data.
-
-## Supported Formats
-- JPEG, PNG, TIFF, BMP, WebP
-
-## Detected Fields
-- Invoice Date
-- Invoice Number
-- Vendor Name
-- Total Amount
-- VAT Amount
-- Line Items
-
-## Response
-Returns detected fields with bounding boxes, confidence scores,
-and optionally extracted text via OCR.
-    """,
-    responses={
-        200: {"description": "Successful processing"},
-        400: {"description": "Invalid input"},
-        413: {"description": "File too large"},
-        415: {"description": "Unsupported media type"},
-        500: {"description": "Internal server error"},
-    },
-)
+@router.post("/api/v1/inference", response_model=InferenceResponse, tags=["inference"])
 async def process_invoice(
-    file: Annotated[UploadFile, File(description="Invoice image file")],
-    confidence_threshold: Annotated[
-        float | None,
-        Query(ge=0.0, le=1.0, description="Override confidence threshold"),
-    ] = None,
-    extract_text: Annotated[
-        bool,
-        Query(description="Run OCR on detected regions"),
-    ] = True,
-    include_visualization: Annotated[
-        bool,
-        Query(description="Include annotated image URL"),
-    ] = False,
-    digitizer: InvoiceDigitizer = Depends(get_digitizer),
-    settings: "Settings" = Depends(get_settings),
+    request: Request,
+    file: Annotated[UploadFile, File(description="Invoice page image")],
+    digitizer: Annotated[InvoiceDigitizer, Depends(get_digitizer)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    confidence_threshold: ConfidenceQuery = None,
+    iou_threshold: IouQuery = None,
 ) -> InferenceResponse:
-    """Process a single invoice image."""
-    request_id = uuid4()
+    """Locate invoice fields on one page image (JPEG, PNG, TIFF, BMP or WebP).
 
-    logger.info(
-        "Processing invoice",
-        request_id=str(request_id),
-        filename=file.filename,
-        content_type=file.content_type,
-    )
-
-    # Validate file
-    if file.content_type not in [
-        "image/jpeg",
-        "image/png",
-        "image/tiff",
-        "image/bmp",
-        "image/webp",
-    ]:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Unsupported file type: {file.content_type}",
-        )
-
-    # Check file size
-    contents = await file.read()
-    max_size = settings.preprocessing.max_file_size_mb * 1024 * 1024
-    if len(contents) > max_size:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File size exceeds maximum of {settings.preprocessing.max_file_size_mb}MB",
-        )
-
+    Returns boxes and confidence scores. Text is not read (no OCR).
+    """
+    image = await _read_upload(file, settings)
+    start = time.perf_counter()
     try:
-        # Convert to numpy array
-        image = Image.open(io.BytesIO(contents))
-        image_array = np.array(image)
-
-        # Process
         result = await digitizer.process_async(
-            image_array,
+            image,
             confidence_threshold=confidence_threshold,
-            extract_text=extract_text,
+            iou_threshold=iou_threshold,
+            source_name="upload",
         )
-
-        logger.info(
-            "Invoice processed",
-            request_id=str(request_id),
-            detections=result.detection_count,
-            processing_time_ms=result.metadata.processing_time_ms,
-        )
-
-        return InferenceResponse(
-            request_id=request_id,
-            result=result,
-            visualization_url=None,  # Would be S3 URL in production
-        )
-
-    except Exception as e:
-        logger.exception("Inference failed", request_id=str(request_id), error=str(e))
+    except Exception as exc:
+        INFERENCE_COUNT.labels("error").inc()
+        logger.exception("inference_failed", request_id=request.state.request_id)
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=str(e),
-        ) from e
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Inference failed. Quote request ID {request.state.request_id}.",
+        ) from exc
+    INFERENCE_COUNT.labels("success").inc()
+    INFERENCE_LATENCY.observe(time.perf_counter() - start)
+    return InferenceResponse(request_id=_request_id(request), result=result)
 
 
-@router.post(
-    "/api/v1/inference/batch",
-    response_model=BatchProcessResponse,
-    summary="Batch Process Invoices",
-    description="""
-Process multiple invoice images in a batch.
-
-Files are processed concurrently for optimal throughput.
-Results are returned when all files have been processed.
-    """,
-)
+@router.post("/api/v1/inference/batch", response_model=BatchProcessResponse, tags=["inference"])
 async def batch_process_invoices(
-    files: Annotated[list[UploadFile], File(description="Invoice image files")],
-    confidence_threshold: Annotated[
-        float | None,
-        Query(ge=0.0, le=1.0, description="Override confidence threshold"),
-    ] = None,
-    extract_text: Annotated[
-        bool,
-        Query(description="Run OCR on detected regions"),
-    ] = True,
-    digitizer: InvoiceDigitizer = Depends(get_digitizer),
-    settings: "Settings" = Depends(get_settings),
+    request: Request,
+    files: Annotated[list[UploadFile], File(description="Invoice page images")],
+    digitizer: Annotated[InvoiceDigitizer, Depends(get_digitizer)],
+    settings: Annotated[Settings, Depends(get_app_settings)],
+    confidence_threshold: ConfidenceQuery = None,
 ) -> BatchProcessResponse:
-    """Process multiple invoice images."""
-    job_id = uuid4()
-    request_id = uuid4()
+    """Process several images in one request and wait for all of them.
 
-    logger.info(
-        "Starting batch processing",
-        job_id=str(job_id),
-        file_count=len(files),
-    )
-
-    if len(files) > 100:
+    Files that fail validation or inference are listed in ``errors``; the rest are
+    returned in ``results``.
+    """
+    if len(files) > settings.api.max_batch_files:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Maximum 100 files per batch",
+            status_code=http_status.HTTP_400_BAD_REQUEST,
+            detail=f"At most {settings.api.max_batch_files} files per batch.",
         )
 
-    results: list[DetectionResult] = []
     errors: list[ErrorDetail] = []
-
-    for file in files:
+    images: list[np.ndarray] = []
+    names: list[str | None] = []
+    for upload in files:
         try:
-            contents = await file.read()
-            image = Image.open(io.BytesIO(contents))
-            image_array = np.array(image)
-
-            result = await digitizer.process_async(
-                image_array,
-                confidence_threshold=confidence_threshold,
-                extract_text=extract_text,
-            )
-            results.append(result)
-
-        except Exception as e:
+            images.append(await _read_upload(upload, settings))
+            names.append(upload.filename)
+        except HTTPException as exc:
             errors.append(
-                ErrorDetail(
-                    code="PROCESSING_ERROR",
-                    message=str(e),
-                    field=file.filename,
-                )
+                ErrorDetail(code="INVALID_FILE", message=str(exc.detail), field=upload.filename)
             )
 
-    job_status = BatchJobStatus.COMPLETED
-    if errors and not results:
-        job_status = BatchJobStatus.FAILED
-    elif errors:
-        job_status = BatchJobStatus.PARTIAL
+    start = time.perf_counter()
+    outcomes = await digitizer.process_batch(list(images), confidence_threshold)
+    results: list[DetectionResult] = []
+    for name, outcome in zip(names, outcomes, strict=True):
+        if outcome.succeeded:
+            INFERENCE_COUNT.labels("success").inc()
+            results.append(outcome)
+        else:
+            INFERENCE_COUNT.labels("error").inc()
+            errors.append(
+                ErrorDetail(code="PROCESSING_ERROR", message="Inference failed.", field=name)
+            )
+    if images:
+        INFERENCE_LATENCY.observe((time.perf_counter() - start) / len(images))
 
-    logger.info(
-        "Batch processing complete",
-        job_id=str(job_id),
-        processed=len(results),
-        failed=len(errors),
-    )
+    if not errors:
+        job_status, status = BatchJobStatus.COMPLETED, ResponseStatus.SUCCESS
+    elif results:
+        job_status, status = BatchJobStatus.PARTIAL, ResponseStatus.PARTIAL
+    else:
+        job_status, status = BatchJobStatus.FAILED, ResponseStatus.ERROR
 
     return BatchProcessResponse(
-        request_id=request_id,
-        job_id=job_id,
+        status=status,
+        request_id=_request_id(request),
         job_status=job_status,
         total_images=len(files),
         processed_images=len(results),
         failed_images=len(errors),
-        results=results if results else None,
-        errors=errors if errors else None,
+        results=results,
+        errors=errors,
     )
 
 
-# ============================================================================
-# Model Management Endpoints
-# ============================================================================
+# ---------------------------------------------------------------------------
+# Model information and administration
+# ---------------------------------------------------------------------------
 
 
-@router.get(
-    "/api/v1/model/info",
-    summary="Get Model Information",
-    description="Get information about the loaded ML model.",
-)
-async def get_model_info(request: Request) -> dict[str, Any]:
-    """Get model information and statistics."""
-    model_manager = request.app.state.model_manager
-    return model_manager.get_model_info()
+@router.get("/api/v1/model/info", tags=["model"])
+async def get_model_info(
+    manager: Annotated[ModelManager, Depends(get_model_manager)],
+) -> dict[str, Any]:
+    """What is loaded, from where, on which device, with which thresholds."""
+    return manager.info()
+
+
+@router.get("/api/v1/classes", tags=["model"])
+async def list_classes(
+    settings: Annotated[Settings, Depends(get_app_settings)],
+) -> dict[str, list[str]]:
+    """The field types the model is expected to detect."""
+    return {"classes": list(settings.model.classes)}
 
 
 @router.put(
     "/api/v1/model/config",
-    summary="Update Model Configuration",
-    description="Update model inference configuration (thresholds, etc.).",
+    response_model=ModelConfigResponse,
+    tags=["admin"],
+    dependencies=[Depends(require_admin)],
 )
 async def update_model_config(
     config: ModelConfigRequest,
-    request: Request,
-) -> dict[str, str]:
-    """Update model configuration dynamically."""
-    model_manager = request.app.state.model_manager
-
+    manager: Annotated[ModelManager, Depends(get_model_manager)],
+) -> ModelConfigResponse:
+    """Change default thresholds for this process. Needs the admin key."""
     updates = config.get_updates()
     if not updates:
-        return {"message": "No updates provided"}
-
-    if "confidence_threshold" in updates or "iou_threshold" in updates:
-        model_manager.update_thresholds(
-            confidence=updates.get("confidence_threshold"),
-            iou=updates.get("iou_threshold"),
-        )
-
-    logger.info("Model config updated", updates=updates)
-    return {"message": "Configuration updated", "updates": updates}
+        return ModelConfigResponse(message="No updates provided", thresholds=manager.thresholds())
+    thresholds = manager.update_thresholds(
+        confidence=updates.get("confidence_threshold"),
+        iou=updates.get("iou_threshold"),
+        max_detections=updates.get("max_detections"),
+    )
+    return ModelConfigResponse(message="Thresholds updated", thresholds=thresholds)
 
 
-@router.post(
-    "/api/v1/model/reload",
-    summary="Reload Model",
-    description="Force reload the ML model from disk.",
-)
-async def reload_model(request: Request) -> dict[str, str]:
-    """Reload the model weights."""
-    model_manager = request.app.state.model_manager
-    model_manager.reload_model()
+@router.post("/api/v1/model/reload", tags=["admin"], dependencies=[Depends(require_admin)])
+async def reload_model(
+    manager: Annotated[ModelManager, Depends(get_model_manager)],
+) -> dict[str, Any]:
+    """Load the weights again and swap them in. Needs the admin key.
 
-    # Also recreate the digitizer
-    if hasattr(request.app.state, "digitizer"):
-        del request.app.state.digitizer
-
-    return {"message": "Model reloaded successfully"}
-
-
-# ============================================================================
-# Utility Endpoints
-# ============================================================================
-
-
-@router.get(
-    "/api/v1/classes",
-    summary="List Detection Classes",
-    description="Get the list of invoice fields the model can detect.",
-)
-async def list_classes(settings: "Settings" = Depends(get_settings)) -> dict[str, list[str]]:
-    """Get list of detection classes."""
-    return {"classes": settings.model.classes}
+    The old model keeps serving until the new one is ready; if loading fails, the old
+    model stays. This affects only the process that handles the request.
+    """
+    try:
+        await asyncio.to_thread(manager.reload)
+    except Exception as exc:
+        logger.exception("model_reload_failed")
+        raise HTTPException(
+            status_code=http_status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Reload failed; the previous model is still serving.",
+        ) from exc
+    return {"message": "Model reloaded", "model": manager.info()}
