@@ -1,16 +1,19 @@
-"""Invoice field detection using YOLOv5."""
+"""Turn raw model boxes into validated invoice fields."""
 
 from __future__ import annotations
 
 import time
+
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-import cv2
 import numpy as np
 import structlog
-import torch
 
+from PIL import Image, ImageDraw
+
+from invoice_digitizer.config.settings import get_settings
+from invoice_digitizer.core.images import ImageSource, load_image
 from invoice_digitizer.core.model_manager import ModelManager
 from invoice_digitizer.schemas.detection import (
     BoundingBox,
@@ -24,396 +27,211 @@ if TYPE_CHECKING:
     from numpy.typing import NDArray
 
     from invoice_digitizer.config.settings import Settings
+    from invoice_digitizer.core.yolov5_backend import RawDetection
 
 logger = structlog.get_logger(__name__)
 
+# Class-name spellings seen in YOLO label files, mapped to the canonical field type.
+_ALIASES: dict[str, InvoiceFieldType] = {
+    "invoice_date": InvoiceFieldType.INVOICE_DATE,
+    "date": InvoiceFieldType.INVOICE_DATE,
+    "invoice_number": InvoiceFieldType.INVOICE_NUMBER,
+    "number": InvoiceFieldType.INVOICE_NUMBER,
+    "vendor_name": InvoiceFieldType.VENDOR_NAME,
+    "vendor": InvoiceFieldType.VENDOR_NAME,
+    "total_amount": InvoiceFieldType.TOTAL_AMOUNT,
+    "total": InvoiceFieldType.TOTAL_AMOUNT,
+    "vat_amount": InvoiceFieldType.VAT_AMOUNT,
+    "vat": InvoiceFieldType.VAT_AMOUNT,
+    "line_item": InvoiceFieldType.LINE_ITEM,
+    "item": InvoiceFieldType.LINE_ITEM,
+}
+
+_COLOURS: dict[InvoiceFieldType, tuple[int, int, int]] = {
+    InvoiceFieldType.INVOICE_DATE: (0, 158, 115),
+    InvoiceFieldType.INVOICE_NUMBER: (0, 114, 178),
+    InvoiceFieldType.VENDOR_NAME: (213, 94, 0),
+    InvoiceFieldType.TOTAL_AMOUNT: (204, 121, 167),
+    InvoiceFieldType.VAT_AMOUNT: (230, 159, 0),
+    InvoiceFieldType.LINE_ITEM: (86, 180, 233),
+}
+
+
+def map_label(class_name: str) -> InvoiceFieldType | None:
+    """Map a model class name to a field type, or None if it is not an invoice field."""
+    try:
+        return InvoiceFieldType(class_name)
+    except ValueError:
+        pass
+    normalised = class_name.strip().lower().replace(" ", "_").replace("-", "_")
+    return _ALIASES.get(normalised)
+
+
+def to_fields(raw: list[RawDetection], width: int, height: int) -> tuple[list[InvoiceField], int]:
+    """Convert raw boxes to fields, clipped to the image, highest confidence first.
+
+    Returns:
+        The fields and how many raw boxes were dropped (unknown class, or no area left
+        after clipping). The count is reported so a silent failure, such as serving a
+        model trained on other classes, shows up in every response.
+    """
+    fields: list[InvoiceField] = []
+    ignored = 0
+    for box in raw:
+        label = map_label(box.class_name)
+        x_min, x_max = max(0.0, box.x_min), min(float(width), box.x_max)
+        y_min, y_max = max(0.0, box.y_min), min(float(height), box.y_max)
+        if label is None or x_max <= x_min or y_max <= y_min:
+            ignored += 1
+            continue
+        fields.append(
+            InvoiceField(
+                label=label,
+                confidence=min(max(box.confidence, 0.0), 1.0),
+                bounding_box=BoundingBox(x_min=x_min, y_min=y_min, x_max=x_max, y_max=y_max),
+            )
+        )
+    fields.sort(key=lambda f: f.confidence, reverse=True)
+    return fields, ignored
+
 
 class InvoiceFieldDetector:
-    """High-performance invoice field detection using YOLOv5.
+    """Runs the model on one image and returns a validated ``DetectionResult``.
 
-    This class provides the core detection functionality, wrapping the
-    YOLOv5 model with invoice-specific preprocessing and postprocessing.
-
-    Attributes:
-        model_manager: Singleton model manager instance.
-        settings: Application settings.
-
-    Example:
-        >>> detector = InvoiceFieldDetector()
-        >>> result = detector.detect("invoice.jpg")
-        >>> print(f"Found {result.detection_count} fields")
+    Args:
+        settings: Application settings. Defaults to ``get_settings()``.
+        model_manager: Shared model owner. Pass one in so several detectors (or the
+            API and a batch job) use a single model in memory.
     """
 
-    def __init__(self, settings: "Settings | None" = None) -> None:
-        """Initialize the detector.
-
-        Args:
-            settings: Application settings. If None, loads from default config.
-        """
-        from invoice_digitizer.config.settings import get_settings
-
+    def __init__(
+        self,
+        settings: Settings | None = None,
+        model_manager: ModelManager | None = None,
+    ) -> None:
         self._settings = settings or get_settings()
-        self._model_manager = ModelManager(self._settings)
-
-        logger.info(
-            "InvoiceFieldDetector initialized",
-            confidence_threshold=self._settings.model.confidence_threshold,
-            device=str(self._model_manager.device),
-        )
+        self._model_manager = model_manager or ModelManager(self._settings.model)
 
     @property
-    def model(self) -> Any:
-        """Get the underlying model."""
-        return self._model_manager.get_model()
-
-    @property
-    def device(self) -> torch.device:
-        """Get the compute device."""
-        return self._model_manager.device
+    def model_manager(self) -> ModelManager:
+        """The model owner used by this detector."""
+        return self._model_manager
 
     def detect(
         self,
-        image_source: str | Path | "NDArray[np.uint8]",
+        image_source: ImageSource,
         confidence_threshold: float | None = None,
         iou_threshold: float | None = None,
+        source_name: str | None = None,
     ) -> DetectionResult:
-        """Detect invoice fields in an image.
+        """Detect invoice fields in one image.
 
         Args:
-            image_source: Path to image file or numpy array (BGR or RGB).
-            confidence_threshold: Override default confidence threshold.
-            iou_threshold: Override default IoU threshold.
-
-        Returns:
-            DetectionResult with all detected fields and metadata.
+            image_source: File path, or an RGB (or grey-scale) uint8 array.
+            confidence_threshold: Override for this call only.
+            iou_threshold: Override for this call only.
+            source_name: Label recorded in the metadata instead of the default.
 
         Raises:
-            FileNotFoundError: If image file doesn't exist.
-            ValueError: If image cannot be processed.
+            FileNotFoundError: The file does not exist.
+            ImageValidationError: The input is not an acceptable image.
         """
-        start_time = time.perf_counter()
-
-        # Load and validate image
-        image, image_path = self._load_image(image_source)
+        start = time.perf_counter()
+        image, default_name = load_image(image_source, self._settings.preprocessing)
         height, width = image.shape[:2]
 
-        logger.debug(
-            "Processing image",
-            source=image_path,
-            dimensions=f"{width}x{height}",
+        raw, loaded = self._model_manager.predict(
+            image, confidence=confidence_threshold, iou=iou_threshold
         )
+        fields, ignored = to_fields(raw, width, height)
 
-        # Update thresholds if specified
-        if confidence_threshold is not None or iou_threshold is not None:
-            self._model_manager.update_thresholds(confidence_threshold, iou_threshold)
-
-        # Run inference
-        with torch.no_grad():
-            results = self.model(image, size=self._settings.model.image_size)
-
-        # Parse results
-        detections = self._parse_detections(results)
-
-        # Calculate processing time
-        processing_time_ms = (time.perf_counter() - start_time) * 1000
-
-        # Build metadata
         metadata = ProcessingMetadata(
-            processing_time_ms=processing_time_ms,
-            model_version=self._model_manager.model_version,
-            device=str(self.device),
+            processing_time_ms=(time.perf_counter() - start) * 1000,
+            model_version=loaded.version,
+            device=loaded.device,
             image_width=width,
             image_height=height,
-            image_source=image_path,
+            image_source=source_name or default_name,
+            ignored_detections=ignored,
         )
-
-        result = DetectionResult(
-            metadata=metadata,
-            detections=detections,
-        )
-
+        result = DetectionResult(metadata=metadata, detections=fields)
         logger.info(
-            "Detection complete",
-            detections=len(detections),
-            processing_time_ms=f"{processing_time_ms:.1f}",
-            high_confidence=result.high_confidence_count,
+            "detection_complete",
+            detections=result.detection_count,
+            ignored=ignored,
+            processing_time_ms=round(metadata.processing_time_ms, 1),
         )
-
         return result
 
     def detect_batch(
         self,
-        image_sources: list[str | Path | "NDArray[np.uint8]"],
+        image_sources: list[ImageSource],
         confidence_threshold: float | None = None,
         iou_threshold: float | None = None,
     ) -> list[DetectionResult]:
-        """Detect fields in multiple images.
+        """Detect fields in several images, one after another.
 
-        Args:
-            image_sources: List of image paths or numpy arrays.
-            confidence_threshold: Override default confidence threshold.
-            iou_threshold: Override default IoU threshold.
-
-        Returns:
-            List of DetectionResult, one per image.
+        A failing image produces a result with ``error`` set instead of stopping the batch.
         """
-        results = []
+        results: list[DetectionResult] = []
         for source in image_sources:
             try:
-                result = self.detect(source, confidence_threshold, iou_threshold)
-                results.append(result)
-            except Exception as e:
-                logger.error("Batch detection failed for image", source=str(source), error=str(e))
-                # Create error result
-                results.append(self._create_error_result(source, str(e)))
+                results.append(self.detect(source, confidence_threshold, iou_threshold))
+            except Exception as exc:  # one bad file must not sink the batch
+                logger.warning("batch_item_failed", error_type=type(exc).__name__)
+                results.append(self.error_result(source, exc))
         return results
 
-    def _load_image(
-        self,
-        image_source: str | Path | "NDArray[np.uint8]",
-    ) -> tuple["NDArray[np.uint8]", str]:
-        """Load and validate an image.
-
-        Args:
-            image_source: Path to image or numpy array.
-
-        Returns:
-            Tuple of (image array, source identifier).
-
-        Raises:
-            FileNotFoundError: If file doesn't exist.
-            ValueError: If image cannot be loaded.
-        """
-        if isinstance(image_source, np.ndarray):
-            return image_source, "memory_buffer"
-
-        path = Path(image_source)
-        if not path.exists():
-            raise FileNotFoundError(f"Image not found: {path}")
-
-        # Validate extension
-        if path.suffix.lower() not in self._settings.preprocessing.supported_formats:
-            raise ValueError(f"Unsupported image format: {path.suffix}")
-
-        # Load image
-        image = cv2.imread(str(path))
-        if image is None:
-            raise ValueError(f"Failed to load image: {path}")
-
-        # Check size limits
-        height, width = image.shape[:2]
-        max_dim = self._settings.preprocessing.max_image_dimension
-        if width > max_dim or height > max_dim:
-            logger.warning(
-                "Image exceeds maximum dimension, will be resized",
-                original=f"{width}x{height}",
-                max_allowed=max_dim,
-            )
-
-        return image, str(path)
-
-    def _parse_detections(self, results: Any) -> list[InvoiceField]:
-        """Parse YOLOv5 results into InvoiceField objects.
-
-        Args:
-            results: Raw YOLOv5 inference results.
-
-        Returns:
-            List of InvoiceField detections.
-        """
-        detections = []
-
-        # Get pandas dataframe from results
-        df = results.pandas().xyxy[0]
-
-        for _, row in df.iterrows():
-            try:
-                # Map class name to InvoiceFieldType
-                label = self._map_label(row["name"])
-
-                bounding_box = BoundingBox(
-                    x_min=float(row["xmin"]),
-                    y_min=float(row["ymin"]),
-                    x_max=float(row["xmax"]),
-                    y_max=float(row["ymax"]),
-                )
-
-                field = InvoiceField(
-                    label=label,
-                    confidence=float(row["confidence"]),
-                    bounding_box=bounding_box,
-                )
-
-                detections.append(field)
-
-            except (KeyError, ValueError) as e:
-                logger.warning("Failed to parse detection", error=str(e), row=dict(row))
-                continue
-
-        # Sort by confidence descending
-        detections.sort(key=lambda x: x.confidence, reverse=True)
-
-        return detections
-
-    def _map_label(self, class_name: str) -> InvoiceFieldType:
-        """Map YOLOv5 class name to InvoiceFieldType.
-
-        Args:
-            class_name: Raw class name from model.
-
-        Returns:
-            Corresponding InvoiceFieldType enum value.
-
-        Raises:
-            ValueError: If class name is unknown.
-        """
-        # Handle exact matches
-        try:
-            return InvoiceFieldType(class_name)
-        except ValueError:
-            pass
-
-        # Handle common variations
-        name_mapping = {
-            "invoice_date": InvoiceFieldType.INVOICE_DATE,
-            "invoice_number": InvoiceFieldType.INVOICE_NUMBER,
-            "vendor_name": InvoiceFieldType.VENDOR_NAME,
-            "total_amount": InvoiceFieldType.TOTAL_AMOUNT,
-            "vat_amount": InvoiceFieldType.VAT_AMOUNT,
-            "line_item": InvoiceFieldType.LINE_ITEM,
-            "date": InvoiceFieldType.INVOICE_DATE,
-            "number": InvoiceFieldType.INVOICE_NUMBER,
-            "vendor": InvoiceFieldType.VENDOR_NAME,
-            "total": InvoiceFieldType.TOTAL_AMOUNT,
-            "vat": InvoiceFieldType.VAT_AMOUNT,
-            "item": InvoiceFieldType.LINE_ITEM,
-        }
-
-        normalized = class_name.lower().replace(" ", "_").replace("-", "_")
-        if normalized in name_mapping:
-            return name_mapping[normalized]
-
-        raise ValueError(f"Unknown class name: {class_name}")
-
-    def _create_error_result(
-        self,
-        source: str | Path | "NDArray[np.uint8]",
-        error: str,
-    ) -> DetectionResult:
-        """Create an error result for failed processing.
-
-        Args:
-            source: Image source that failed.
-            error: Error message.
-
-        Returns:
-            DetectionResult with empty detections and error info.
-        """
-        source_str = str(source) if not isinstance(source, np.ndarray) else "memory_buffer"
-
+    def error_result(self, source: ImageSource, error: BaseException | str) -> DetectionResult:
+        """Build a result that records a failure without loading the model."""
+        loaded = self._model_manager.info()
+        name = "memory_buffer" if isinstance(source, np.ndarray) else Path(source).name
         metadata = ProcessingMetadata(
-            processing_time_ms=0,
-            model_version=self._model_manager.model_version,
-            device=str(self.device),
+            processing_time_ms=0.0,
+            model_version=loaded["version"] or "not loaded",
+            device=loaded["device"] or "n/a",
             image_width=0,
             image_height=0,
-            image_source=f"{source_str} (ERROR: {error})",
+            image_source=name,
         )
-
-        return DetectionResult(metadata=metadata, detections=[])
+        return DetectionResult(metadata=metadata, detections=[], error=str(error))
 
     def visualize(
         self,
-        image_source: str | Path | "NDArray[np.uint8]",
+        image_source: ImageSource,
         result: DetectionResult,
         output_path: str | Path | None = None,
-        show_labels: bool = True,
         show_confidence: bool = True,
-        line_thickness: int = 2,
-    ) -> "NDArray[np.uint8]":
-        """Draw detection boxes on an image.
-
-        Args:
-            image_source: Original image.
-            result: Detection result to visualize.
-            output_path: If provided, save annotated image to this path.
-            show_labels: Whether to show field labels.
-            show_confidence: Whether to show confidence scores.
-            line_thickness: Bounding box line thickness.
+        line_width: int = 3,
+    ) -> NDArray[np.uint8]:
+        """Draw the detected boxes on the image.
 
         Returns:
-            Annotated image as numpy array.
+            The annotated image as an RGB array. Also saved when ``output_path`` is given.
         """
-        # Load image
-        image, _ = self._load_image(image_source)
-        annotated = image.copy()
-
-        # Color mapping for different field types
-        colors = {
-            InvoiceFieldType.INVOICE_DATE: (0, 255, 0),      # Green
-            InvoiceFieldType.INVOICE_NUMBER: (255, 0, 0),   # Blue
-            InvoiceFieldType.VENDOR_NAME: (0, 0, 255),      # Red
-            InvoiceFieldType.TOTAL_AMOUNT: (255, 255, 0),   # Cyan
-            InvoiceFieldType.VAT_AMOUNT: (255, 0, 255),     # Magenta
-            InvoiceFieldType.LINE_ITEM: (0, 255, 255),      # Yellow
-        }
-
-        for detection in result.detections:
-            bbox = detection.bounding_box
-            color = colors.get(detection.label, (128, 128, 128))
-
-            # Draw bounding box
-            pt1 = (int(bbox.x_min), int(bbox.y_min))
-            pt2 = (int(bbox.x_max), int(bbox.y_max))
-            cv2.rectangle(annotated, pt1, pt2, color, line_thickness)
-
-            # Draw label
-            if show_labels or show_confidence:
-                label_parts = []
-                if show_labels:
-                    label_parts.append(detection.label.value)
-                if show_confidence:
-                    label_parts.append(f"{detection.confidence:.0%}")
-                label = " ".join(label_parts)
-
-                # Calculate label position and background
-                font_scale = 0.5
-                font_thickness = 1
-                (text_width, text_height), baseline = cv2.getTextSize(
-                    label, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness
-                )
-
-                # Background rectangle
-                cv2.rectangle(
-                    annotated,
-                    (pt1[0], pt1[1] - text_height - baseline - 5),
-                    (pt1[0] + text_width + 5, pt1[1]),
-                    color,
-                    -1,
-                )
-
-                # Text
-                cv2.putText(
-                    annotated,
-                    label,
-                    (pt1[0] + 2, pt1[1] - baseline - 2),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    font_scale,
-                    (255, 255, 255),
-                    font_thickness,
-                )
-
-        # Save if output path provided
+        image, _ = load_image(image_source, self._settings.preprocessing)
+        canvas = Image.fromarray(image)
+        draw = ImageDraw.Draw(canvas)
+        for field in result.detections:
+            colour = _COLOURS.get(field.label, (128, 128, 128))
+            box = field.bounding_box.to_xyxy()
+            draw.rectangle(box, outline=colour, width=line_width)
+            label = field.label.value
+            if show_confidence:
+                label = f"{label} {field.confidence:.0%}"
+            text_box = draw.textbbox((box[0], box[1]), label)
+            text_height = text_box[3] - text_box[1]
+            top = max(0.0, box[1] - text_height - 4)
+            draw.rectangle(
+                (box[0], top, box[0] + (text_box[2] - text_box[0]) + 4, top + text_height + 4),
+                fill=colour,
+            )
+            draw.text((box[0] + 2, top + 2), label, fill=(255, 255, 255))
         if output_path is not None:
-            cv2.imwrite(str(output_path), annotated)
-            logger.info("Saved annotated image", path=str(output_path))
-
-        return annotated
+            canvas.save(output_path)
+            logger.info("annotated_image_saved", path=str(output_path))
+        return np.asarray(canvas, dtype=np.uint8)
 
     def get_model_info(self) -> dict[str, Any]:
-        """Get model information.
-
-        Returns:
-            Dictionary with model metadata.
-        """
-        return self._model_manager.get_model_info()
+        """Model description, without forcing a load."""
+        return self._model_manager.info()

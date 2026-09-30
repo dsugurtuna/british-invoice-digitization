@@ -1,38 +1,39 @@
-"""Pydantic schemas for data validation and serialization."""
+"""Pydantic schemas for results, requests and responses."""
 
 from invoice_digitizer.schemas.detection import (
     BoundingBox,
     DetectionResult,
     InvoiceField,
+    InvoiceFieldType,
     ProcessingMetadata,
 )
-from invoice_digitizer.schemas.request import (
-    BatchProcessRequest,
-    InferenceRequest,
-    ModelConfigRequest,
-)
+from invoice_digitizer.schemas.request import ModelConfigRequest
 from invoice_digitizer.schemas.response import (
-    APIResponse,
+    BatchJobStatus,
     BatchProcessResponse,
-    ErrorResponse,
+    ComponentHealth,
+    ErrorDetail,
     HealthResponse,
+    HealthStatus,
     InferenceResponse,
+    ModelConfigResponse,
+    ResponseStatus,
 )
 
 __all__ = [
-    # Detection schemas
-    "BoundingBox",
-    "DetectionResult",
-    "InvoiceField",
-    "ProcessingMetadata",
-    # Request schemas
-    "BatchProcessRequest",
-    "InferenceRequest",
-    "ModelConfigRequest",
-    # Response schemas
-    "APIResponse",
+    "BatchJobStatus",
     "BatchProcessResponse",
-    "ErrorResponse",
+    "BoundingBox",
+    "ComponentHealth",
+    "DetectionResult",
+    "ErrorDetail",
     "HealthResponse",
+    "HealthStatus",
     "InferenceResponse",
+    "InvoiceField",
+    "InvoiceFieldType",
+    "ModelConfigRequest",
+    "ModelConfigResponse",
+    "ProcessingMetadata",
+    "ResponseStatus",
 ]

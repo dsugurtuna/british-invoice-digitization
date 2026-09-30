@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
-from datetime import datetime
-from enum import Enum
+from datetime import UTC, datetime
+from enum import StrEnum
 from typing import Any
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationInfo, field_validator
+
+HIGH_CONFIDENCE = 0.8
+REVIEW_BELOW = 0.6
 
 
-class InvoiceFieldType(str, Enum):
-    """Invoice field types detected by the model."""
+class InvoiceFieldType(StrEnum):
+    """The six field types the model is trained to locate."""
 
     INVOICE_DATE = "Invoice Date"
     INVOICE_NUMBER = "Invoice Number"
@@ -21,187 +24,179 @@ class InvoiceFieldType(str, Enum):
     LINE_ITEM = "Line Item"
 
 
-class BoundingBox(BaseModel):
-    """Bounding box coordinates for a detected field.
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
 
-    Coordinates are in XYXY format (top-left x, top-left y, bottom-right x, bottom-right y).
-    All values are in pixels relative to the original image dimensions.
-    """
+
+class BoundingBox(BaseModel):
+    """Box in pixel coordinates of the original image, XYXY order."""
 
     model_config = ConfigDict(frozen=True)
 
-    x_min: float = Field(..., ge=0, description="Left edge X coordinate")
-    y_min: float = Field(..., ge=0, description="Top edge Y coordinate")
-    x_max: float = Field(..., ge=0, description="Right edge X coordinate")
-    y_max: float = Field(..., ge=0, description="Bottom edge Y coordinate")
+    x_min: float = Field(..., ge=0, description="Left edge")
+    y_min: float = Field(..., ge=0, description="Top edge")
+    x_max: float = Field(..., ge=0, description="Right edge")
+    y_max: float = Field(..., ge=0, description="Bottom edge")
 
     @field_validator("x_max")
     @classmethod
-    def x_max_greater_than_x_min(cls, v: float, info: Any) -> float:
-        """Ensure x_max > x_min."""
-        if "x_min" in info.data and v <= info.data["x_min"]:
-            msg = "x_max must be greater than x_min"
-            raise ValueError(msg)
-        return v
+    def _x_max_after_x_min(cls, value: float, info: ValidationInfo) -> float:
+        if "x_min" in info.data and value <= info.data["x_min"]:
+            raise ValueError("x_max must be greater than x_min")
+        return value
 
     @field_validator("y_max")
     @classmethod
-    def y_max_greater_than_y_min(cls, v: float, info: Any) -> float:
-        """Ensure y_max > y_min."""
-        if "y_min" in info.data and v <= info.data["y_min"]:
-            msg = "y_max must be greater than y_min"
-            raise ValueError(msg)
-        return v
+    def _y_max_after_y_min(cls, value: float, info: ValidationInfo) -> float:
+        if "y_min" in info.data and value <= info.data["y_min"]:
+            raise ValueError("y_max must be greater than y_min")
+        return value
 
     @property
     def width(self) -> float:
-        """Calculate bounding box width."""
+        """Box width."""
         return self.x_max - self.x_min
 
     @property
     def height(self) -> float:
-        """Calculate bounding box height."""
+        """Box height."""
         return self.y_max - self.y_min
 
     @property
     def area(self) -> float:
-        """Calculate bounding box area."""
+        """Box area."""
         return self.width * self.height
 
     @property
     def center(self) -> tuple[float, float]:
-        """Calculate center point of bounding box."""
+        """Centre point."""
         return ((self.x_min + self.x_max) / 2, (self.y_min + self.y_max) / 2)
 
     def to_xywh(self) -> tuple[float, float, float, float]:
-        """Convert to XYWH format (center x, center y, width, height)."""
+        """Centre x, centre y, width, height."""
         cx, cy = self.center
         return (cx, cy, self.width, self.height)
 
     def to_xyxy(self) -> tuple[float, float, float, float]:
-        """Return as XYXY tuple."""
+        """x_min, y_min, x_max, y_max."""
         return (self.x_min, self.y_min, self.x_max, self.y_max)
 
-    def iou(self, other: "BoundingBox") -> float:
-        """Calculate Intersection over Union with another bounding box."""
-        # Calculate intersection
-        x_inter_min = max(self.x_min, other.x_min)
-        y_inter_min = max(self.y_min, other.y_min)
-        x_inter_max = min(self.x_max, other.x_max)
-        y_inter_max = min(self.y_max, other.y_max)
-
-        if x_inter_max <= x_inter_min or y_inter_max <= y_inter_min:
+    def iou(self, other: BoundingBox) -> float:
+        """Intersection over union with another box."""
+        x_left = max(self.x_min, other.x_min)
+        y_top = max(self.y_min, other.y_min)
+        x_right = min(self.x_max, other.x_max)
+        y_bottom = min(self.y_max, other.y_max)
+        if x_right <= x_left or y_bottom <= y_top:
             return 0.0
-
-        intersection = (x_inter_max - x_inter_min) * (y_inter_max - y_inter_min)
+        intersection = (x_right - x_left) * (y_bottom - y_top)
         union = self.area + other.area - intersection
-
         return intersection / union if union > 0 else 0.0
 
 
 class InvoiceField(BaseModel):
-    """A detected invoice field with its properties."""
+    """One detected field."""
 
     model_config = ConfigDict(populate_by_name=True)
 
-    field_id: UUID = Field(default_factory=uuid4, description="Unique field identifier")
-    label: InvoiceFieldType = Field(..., description="Type of invoice field detected")
-    confidence: float = Field(..., ge=0.0, le=1.0, description="Detection confidence score")
-    bounding_box: BoundingBox = Field(..., description="Field location in image")
+    field_id: UUID = Field(default_factory=uuid4)
+    label: InvoiceFieldType
+    confidence: float = Field(..., ge=0.0, le=1.0, description="Detector confidence")
+    bounding_box: BoundingBox
     extracted_text: str | None = Field(
-        default=None, description="OCR-extracted text from the field region"
+        default=None,
+        description="Reserved for an OCR step. This service does not run OCR, so it is null.",
     )
-    ocr_confidence: float | None = Field(
-        default=None, ge=0.0, le=1.0, description="OCR extraction confidence"
-    )
+    ocr_confidence: float | None = Field(default=None, ge=0.0, le=1.0)
 
     @property
     def is_high_confidence(self) -> bool:
-        """Check if detection has high confidence (>= 0.8)."""
-        return self.confidence >= 0.8
+        """Confidence of at least 0.8."""
+        return self.confidence >= HIGH_CONFIDENCE
 
     @property
     def needs_review(self) -> bool:
-        """Check if detection needs manual review (confidence < 0.6)."""
-        return self.confidence < 0.6
+        """Confidence below 0.6: worth a human look.
+
+        The 0.6 and 0.8 cut-offs are conventions, not calibrated values. Detector
+        confidence is not a probability of being correct unless it has been calibrated
+        on held-out data.
+        """
+        return self.confidence < REVIEW_BELOW
 
 
 class ProcessingMetadata(BaseModel):
-    """Metadata about the processing operation."""
+    """What was processed, how, and with which model."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, protected_namespaces=())
 
-    request_id: UUID = Field(default_factory=uuid4, description="Unique request identifier")
-    timestamp: datetime = Field(default_factory=datetime.utcnow, description="Processing timestamp")
-    processing_time_ms: float = Field(..., ge=0, description="Total processing time in milliseconds")
-    model_version: str = Field(..., description="Model version used for inference")
-    device: str = Field(..., description="Compute device used (cpu/cuda)")
-    image_width: int = Field(..., ge=1, description="Original image width in pixels")
-    image_height: int = Field(..., ge=1, description="Original image height in pixels")
-    image_source: str = Field(..., description="Image source identifier or filename")
+    request_id: UUID = Field(default_factory=uuid4)
+    timestamp: datetime = Field(default_factory=_utc_now)
+    processing_time_ms: float = Field(..., ge=0)
+    model_version: str = Field(..., description="Hub repo and weights fingerprint")
+    device: str
+    image_width: int = Field(..., ge=0, description="0 when the image could not be read")
+    image_height: int = Field(..., ge=0, description="0 when the image could not be read")
+    image_source: str = Field(..., description="File name, 'upload' or 'memory_buffer'")
+    ignored_detections: int = Field(
+        default=0,
+        ge=0,
+        description=(
+            "Boxes the model returned that were dropped: unknown class names or boxes "
+            "with no area after clipping to the image."
+        ),
+    )
 
 
 class DetectionResult(BaseModel):
-    """Complete detection result for an invoice image."""
+    """All fields found on one image, or the reason it failed."""
 
     model_config = ConfigDict(populate_by_name=True)
 
-    metadata: ProcessingMetadata = Field(..., description="Processing metadata")
-    detections: list[InvoiceField] = Field(
-        default_factory=list, description="List of detected fields"
-    )
-    raw_image_path: str | None = Field(
-        default=None, description="Path to the processed image (if stored)"
-    )
-    annotated_image_path: str | None = Field(
-        default=None, description="Path to annotated visualization"
-    )
+    metadata: ProcessingMetadata
+    detections: list[InvoiceField] = Field(default_factory=list)
+    error: str | None = Field(default=None, description="Set when processing failed")
+
+    @property
+    def succeeded(self) -> bool:
+        """True when the image was processed, even if nothing was found."""
+        return self.error is None
 
     @property
     def detection_count(self) -> int:
-        """Get total number of detections."""
+        """Number of detected fields."""
         return len(self.detections)
 
     @property
     def high_confidence_count(self) -> int:
-        """Get count of high-confidence detections."""
+        """Number of detections with confidence of at least 0.8."""
         return sum(1 for d in self.detections if d.is_high_confidence)
 
     @property
     def fields_by_type(self) -> dict[InvoiceFieldType, list[InvoiceField]]:
-        """Group detections by field type."""
-        result: dict[InvoiceFieldType, list[InvoiceField]] = {}
+        """Detections grouped by field type."""
+        grouped: dict[InvoiceFieldType, list[InvoiceField]] = {}
         for detection in self.detections:
-            if detection.label not in result:
-                result[detection.label] = []
-            result[detection.label].append(detection)
-        return result
+            grouped.setdefault(detection.label, []).append(detection)
+        return grouped
 
     def get_field(self, field_type: InvoiceFieldType) -> InvoiceField | None:
-        """Get the highest confidence detection for a specific field type."""
+        """Highest-confidence detection of one field type, if any."""
         fields = [d for d in self.detections if d.label == field_type]
-        if not fields:
-            return None
-        return max(fields, key=lambda x: x.confidence)
+        return max(fields, key=lambda d: d.confidence) if fields else None
 
     def to_flat_dict(self) -> dict[str, Any]:
-        """Convert to flat dictionary for easy export (CSV, etc.)."""
-        result: dict[str, Any] = {
+        """One flat row per image, for CSV export."""
+        row: dict[str, Any] = {
             "request_id": str(self.metadata.request_id),
             "timestamp": self.metadata.timestamp.isoformat(),
             "processing_time_ms": self.metadata.processing_time_ms,
             "detection_count": self.detection_count,
+            "error": self.error,
         }
-
-        # Add best detection for each field type
         for field_type in InvoiceFieldType:
-            field = self.get_field(field_type)
-            key_prefix = field_type.value.lower().replace(" ", "_")
-            if field:
-                result[f"{key_prefix}_confidence"] = field.confidence
-                result[f"{key_prefix}_text"] = field.extracted_text
-            else:
-                result[f"{key_prefix}_confidence"] = None
-                result[f"{key_prefix}_text"] = None
-
-        return result
+            best = self.get_field(field_type)
+            prefix = field_type.value.lower().replace(" ", "_")
+            row[f"{prefix}_confidence"] = best.confidence if best else None
+            row[f"{prefix}_text"] = best.extracted_text if best else None
+        return row

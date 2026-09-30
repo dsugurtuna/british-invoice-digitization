@@ -1,38 +1,28 @@
-"""
-RoyalAudit Digitizer - Enterprise Invoice Extraction System
-===========================================================
+"""Invoice field detection with YOLOv5, served through FastAPI.
 
-A production-grade ML pipeline for automated extraction of structured
-financial data from unstructured British invoices using YOLOv5.
-
-Modules:
-    - core: Core ML inference engine and model management
-    - api: FastAPI REST endpoints for inference
-    - preprocessing: Image preprocessing and validation
-    - schemas: Pydantic data models and validation
-    - config: Configuration management
-    - utils: Utility functions and helpers
+The package finds where six invoice fields sit on a page image (date, number,
+vendor, total, VAT, line items) and returns bounding boxes with confidence
+scores. It does not read the text inside those boxes.
 
 Example:
     >>> from invoice_digitizer import InvoiceDigitizer
-    >>> digitizer = InvoiceDigitizer()
-    >>> result = await digitizer.process_invoice("invoice.jpg")
-    >>> print(result.detections)
+    >>> digitizer = InvoiceDigitizer()          # needs trained weights, see README
+    >>> result = digitizer.process("invoice.png")
+    >>> [field.label for field in result.detections]
 """
 
-from invoice_digitizer.core.digitizer import InvoiceDigitizer
-from invoice_digitizer.core.detector import InvoiceFieldDetector
-from invoice_digitizer.schemas.detection import DetectionResult, InvoiceField
+from invoice_digitizer._version import __version__
 from invoice_digitizer.config.settings import Settings, get_settings
+from invoice_digitizer.core.detector import InvoiceFieldDetector
+from invoice_digitizer.core.digitizer import InvoiceDigitizer
+from invoice_digitizer.schemas.detection import DetectionResult, InvoiceField
 
 __all__ = [
-    "InvoiceDigitizer",
-    "InvoiceFieldDetector",
     "DetectionResult",
+    "InvoiceDigitizer",
     "InvoiceField",
+    "InvoiceFieldDetector",
     "Settings",
+    "__version__",
     "get_settings",
 ]
-
-__version__ = "2.0.0"
-__author__ = "Ugur Tuna"
