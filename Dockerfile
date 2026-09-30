@@ -1,140 +1,50 @@
-# ============================================================================
-# RoyalAudit Digitizer - Production Dockerfile
-# Multi-stage build for optimized image size and security
-# ============================================================================
+# Container image for the API.
+#
+# Status: not built in CI. It has not been built since these fixes (the author's
+# environment had no Docker daemon), so treat it as a starting point.
+#
+# The image does not contain trained weights. Mount them at /app/models, for example:
+#   docker run -p 8000:8000 -v "$PWD/models:/app/models:ro" british-invoice-digitization
+# On first start, torch.hub downloads the pinned YOLOv5 v7.0 code from GitHub.
 
-# -----------------------------------------------------------------------------
-# Stage 1: Builder
-# Install dependencies and build wheels
-# -----------------------------------------------------------------------------
-FROM python:3.11-slim as builder
+FROM python:3.12-slim
 
-# Build arguments
-ARG TARGETPLATFORM
-ARG BUILDPLATFORM
-
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
 
-WORKDIR /build
-
-# Install build dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    gcc \
-    g++ \
-    git \
+# libglib2.0-0: needed by opencv-python-headless, which the YOLOv5 code imports.
+# curl: health check. tini: forwards signals so the server shuts down cleanly.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libglib2.0-0 curl tini \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency files
-COPY pyproject.toml requirements.txt ./
+RUN groupadd --gid 1000 app && useradd --uid 1000 --gid app --create-home app
+WORKDIR /app
 
-# Create virtual environment and install dependencies
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+# CPU-only PyTorch: a fraction of the size of the default CUDA build.
+# Override TORCH_INDEX_URL to build a GPU image.
+ARG TORCH_INDEX_URL=https://download.pytorch.org/whl/cpu
+RUN pip install torch torchvision --index-url "${TORCH_INDEX_URL}"
 
-# Install dependencies
-RUN pip install --upgrade pip setuptools wheel && \
-    pip install -r requirements.txt
+COPY pyproject.toml README.md LICENSE ./
+COPY src ./src
+RUN pip install ".[yolov5]"
 
-# -----------------------------------------------------------------------------
-# Stage 2: Runtime
-# Minimal image for production deployment
-# -----------------------------------------------------------------------------
-FROM python:3.11-slim as runtime
+COPY config ./config
+RUN mkdir -p models && chown -R app:app /app
+USER app
 
-# Labels for container metadata
-LABEL maintainer="dsugurtuna" \
-      version="2.0.0" \
-      description="RoyalAudit Digitizer - Enterprise Invoice Extraction System" \
-      org.opencontainers.image.source="https://github.com/dsugurtuna/british-invoice-digitization" \
-      org.opencontainers.image.licenses="MIT"
+ENV INVOICE_DIGITIZER_API__HOST=0.0.0.0 \
+    INVOICE_DIGITIZER_ENVIRONMENT=production \
+    INVOICE_DIGITIZER_CONFIG_FILE=/app/config/default.yaml
 
-# Set environment variables
-ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PYTHONFAULTHANDLER=1 \
-    PYTHONHASHSEED=random \
-    # App settings
-    ROYALAUDIT_ENVIRONMENT=production \
-    ROYALAUDIT_API__HOST=0.0.0.0 \
-    ROYALAUDIT_API__PORT=8000 \
-    # Paths
-    APP_HOME=/app \
-    PATH="/opt/venv/bin:$PATH"
+EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=120s --retries=3 \
+    CMD curl --fail --silent http://127.0.0.1:8000/health/live || exit 1
 
-# Create non-root user for security
-RUN groupadd --gid 1000 appgroup && \
-    useradd --uid 1000 --gid appgroup --shell /bin/bash --create-home appuser
-
-WORKDIR ${APP_HOME}
-
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    # OpenCV dependencies
-    libgl1-mesa-glx \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
-    # Utilities
-    curl \
-    tini \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
-
-# Copy virtual environment from builder
-COPY --from=builder /opt/venv /opt/venv
-
-# Copy application code
-COPY --chown=appuser:appgroup src/ ./src/
-COPY --chown=appuser:appgroup config/ ./config/
-COPY --chown=appuser:appgroup pyproject.toml ./
-
-# Create necessary directories
-RUN mkdir -p models output logs && \
-    chown -R appuser:appgroup ${APP_HOME}
-
-# Switch to non-root user
-USER appuser
-
-# Expose ports
-# 8000 - FastAPI
-# 8501 - Streamlit
-# 9090 - Prometheus metrics
-EXPOSE 8000 8501 9090
-
-# Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD curl --fail http://localhost:8000/health/live || exit 1
-
-# Use tini as init system
 ENTRYPOINT ["/usr/bin/tini", "--"]
-
-# Default command - run FastAPI server
-CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
-
-# -----------------------------------------------------------------------------
-# Stage 3: Development (optional)
-# Full development environment with dev dependencies
-# -----------------------------------------------------------------------------
-FROM runtime as development
-
-USER root
-
-# Install development dependencies
-RUN pip install -e ".[dev]"
-
-# Install additional dev tools
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    vim \
-    git \
-    && rm -rf /var/lib/apt/lists/*
-
-USER appuser
-
-# Override command for development
-CMD ["uvicorn", "src.api.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# One process per container: each process loads its own copy of the model, and
+# runtime threshold changes and reloads apply per process. Scale with replicas.
+CMD ["invoice-digitizer"]
