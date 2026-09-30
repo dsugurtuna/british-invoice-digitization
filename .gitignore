@@ -37,3 +37,13 @@ runs/
 yolov5/
 *.log
 .DS_Store
+
+# Tooling output
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+output/

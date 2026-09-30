@@ -1,53 +1,33 @@
-# Contributing to RoyalAudit Digitizer
+# Contributing
 
-First off, thank you for considering contributing to the RoyalAudit Digitizer! It's people like you that make the open-source community such an amazing place to learn, inspire, and create.
+Issues and pull requests are welcome.
 
-## 🤝 Code of Conduct
+## Set up
 
-By participating in this project, you are expected to uphold our Code of Conduct. Please report unacceptable behavior to [dsugurtuna@example.com].
+```bash
+python3 -m venv .venv && source .venv/bin/activate    # Python 3.11 or 3.12
+pip install -e ".[dev]"
+pre-commit install    # optional; runs ruff before each commit
+```
 
-## 🛠 How Can I Contribute?
+## Before opening a pull request
 
-### Reporting Bugs
+```bash
+ruff check .
+ruff format --check .
+mypy
+pytest --cov --cov-fail-under=80
+```
 
-This section guides you through submitting a bug report for RoyalAudit Digitizer. Following these guidelines helps maintainers and the community understand your report, reproduce the behavior, and find related reports.
+CI runs the same commands on Python 3.11 and 3.12.
 
-*   **Use a clear and descriptive title** for the issue to identify the problem.
-*   **Describe the exact steps which reproduce the problem** in as many details as possible.
-*   **Provide specific examples** to demonstrate the steps.
+## Ground rules
 
-### Suggesting Enhancements
+- Tests must pass offline, without PyTorch, weights or a GPU. Fake the model at the
+  `ModelManager` loader or `Predictor` boundary, as `tests/conftest.py` does.
+- Never commit real invoices, personal data, weights or credentials. Use synthetic images.
+- Any number in the README must come from a command in this repository that others can run,
+  or be labelled as an illustrative example.
+- Use conventional commit messages (`feat:`, `fix:`, `docs:`, `test:`, `ci:`, `build:`, `chore:`).
 
-This section guides you through submitting an enhancement suggestion, including completely new features and minor improvements to existing functionality.
-
-*   **Use a clear and descriptive title** for the issue to identify the suggestion.
-*   **Provide a step-by-step description of the suggested enhancement** in as many details as possible.
-*   **Explain why this enhancement would be useful** to most RoyalAudit Digitizer users.
-
-### Pull Requests
-
-1.  Fork the repo and create your branch from `main`.
-2.  If you've added code that should be tested, add tests.
-3.  If you've changed APIs, update the documentation.
-4.  Ensure the test suite passes.
-5.  Make sure your code lints.
-6.  Issue that pull request!
-
-## 💻 Styleguides
-
-### Python Styleguide
-
-*   We follow [PEP 8](https://www.python.org/dev/peps/pep-0008/).
-*   We use [Black](https://github.com/psf/black) for code formatting.
-*   We use [Pylint](https://www.pylint.org/) for linting.
-
-### Commit Messages
-
-*   Use the present tense ("Add feature" not "Added feature")
-*   Use the imperative mood ("Move cursor to..." not "Moves cursor to...")
-*   Limit the first line to 72 characters or less
-*   Reference issues and pull requests liberally after the first line
-
-## 🌍 License
-
-By contributing, you agree that your contributions will be licensed under its MIT License.
+By contributing, you agree that your contributions are licensed under the MIT licence.

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime
 from uuid import UUID
 
 import pytest
 
-from src.schemas.detection import (
+from pydantic import ValidationError
+
+from invoice_digitizer.schemas.detection import (
     BoundingBox,
     DetectionResult,
     InvoiceField,
@@ -91,8 +92,8 @@ class TestBoundingBox:
         """Test that bounding box is immutable."""
         bbox = BoundingBox(x_min=10.0, y_min=20.0, x_max=100.0, y_max=200.0)
 
-        with pytest.raises(Exception):  # Pydantic raises ValidationError
-            bbox.x_min = 50.0  # type: ignore
+        with pytest.raises(ValidationError):
+            bbox.x_min = 50.0  # type: ignore[misc]
 
 
 class TestInvoiceField:
@@ -114,7 +115,7 @@ class TestInvoiceField:
     def test_high_confidence_detection(self) -> None:
         """Test high confidence threshold."""
         bbox = BoundingBox(x_min=0.0, y_min=0.0, x_max=100.0, y_max=100.0)
-        
+
         high_conf = InvoiceField(
             label=InvoiceFieldType.TOTAL_AMOUNT,
             confidence=0.85,
@@ -132,7 +133,7 @@ class TestInvoiceField:
     def test_needs_review(self) -> None:
         """Test review threshold."""
         bbox = BoundingBox(x_min=0.0, y_min=0.0, x_max=100.0, y_max=100.0)
-        
+
         clear = InvoiceField(
             label=InvoiceFieldType.VENDOR_NAME,
             confidence=0.65,
