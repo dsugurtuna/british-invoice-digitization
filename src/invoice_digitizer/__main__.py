@@ -6,6 +6,7 @@ Starts the API with host, port and log level taken from the settings.
 from __future__ import annotations
 
 import logging
+import sys
 
 import structlog
 import uvicorn
@@ -16,7 +17,9 @@ from invoice_digitizer.config.settings import Settings, get_settings
 def configure_logging(level: str, json_output: bool) -> None:
     """Set up structlog: JSON lines in production, readable console output otherwise."""
     renderer: structlog.types.Processor = (
-        structlog.processors.JSONRenderer() if json_output else structlog.dev.ConsoleRenderer()
+        structlog.processors.JSONRenderer()
+        if json_output
+        else structlog.dev.ConsoleRenderer(colors=sys.stdout.isatty())
     )
     structlog.configure(
         processors=[

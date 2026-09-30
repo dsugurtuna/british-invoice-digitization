@@ -244,6 +244,18 @@ class TestInferenceEndpoints:
             assert "secret internal detail" not in response.text
             assert response.headers["X-Request-ID"] in response.json()["detail"]
 
+    def test_missing_weights_is_a_503_with_the_reason(
+        self, api_settings: Settings, invoice_png_bytes: bytes
+    ) -> None:
+        settings = api_settings.model_copy(
+            update={"model": api_settings.model.model_copy(update={"preload": False})}
+        )
+        app = create_app(settings)  # real loader, but no weights file exists
+        with TestClient(app) as client:
+            response = client.post("/api/v1/inference", files=_upload(invoice_png_bytes))
+        assert response.status_code == 503
+        assert "No trained weights" in response.json()["detail"]
+
     def test_batch_partial(self, client: TestClient, invoice_png_bytes: bytes) -> None:
         files = [
             ("files", ("one.png", invoice_png_bytes, "image/png")),

@@ -194,6 +194,11 @@ async def process_invoice(
             iou_threshold=iou_threshold,
             source_name="upload",
         )
+    except FileNotFoundError as exc:  # no weights: the service cannot answer yet
+        INFERENCE_COUNT.labels("error").inc()
+        raise HTTPException(
+            status_code=http_status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)
+        ) from exc
     except Exception as exc:
         INFERENCE_COUNT.labels("error").inc()
         logger.exception("inference_failed", request_id=request.state.request_id)
