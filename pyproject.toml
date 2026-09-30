@@ -65,6 +65,9 @@ dev = [
     "types-PyYAML",
 ]
 
+[project.scripts]
+invoice-digitizer = "invoice_digitizer.__main__:main"
+
 [project.urls]
 Homepage = "https://github.com/dsugurtuna/british-invoice-digitization"
 Repository = "https://github.com/dsugurtuna/british-invoice-digitization.git"

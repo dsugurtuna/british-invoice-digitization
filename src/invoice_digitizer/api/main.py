@@ -1,6 +1,7 @@
 """FastAPI application factory.
 
-Run with ``uvicorn --factory invoice_digitizer.api.main:create_app``.
+Run with ``invoice-digitizer`` (see ``__main__.py``) or
+``uvicorn --factory invoice_digitizer.api.main:create_app``.
 """
 
 from __future__ import annotations
@@ -69,6 +70,7 @@ def create_app(
         title="Invoice Field Detection API",
         description=DESCRIPTION,
         version=__version__,
+        debug=settings.debug,
         lifespan=lifespan,
     )
     app.state.settings = settings
