@@ -1,4 +1,4 @@
-"""Configuration module."""
+"""Configuration."""
 
 from invoice_digitizer.config.settings import Settings, get_settings, reload_settings
 
