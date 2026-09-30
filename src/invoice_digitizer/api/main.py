@@ -12,13 +12,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
 
-from src.api.routes import router
-from src.api.middleware import RequestLoggingMiddleware, RateLimitMiddleware
-from src.config.settings import get_settings
-from src.core.model_manager import ModelManager
+from invoice_digitizer.api.routes import router
+from invoice_digitizer.api.middleware import RequestLoggingMiddleware, RateLimitMiddleware
+from invoice_digitizer.config.settings import get_settings
+from invoice_digitizer.core.model_manager import ModelManager
 
 if TYPE_CHECKING:
-    from src.config.settings import Settings
+    from invoice_digitizer.config.settings import Settings
 
 logger = structlog.get_logger(__name__)
 

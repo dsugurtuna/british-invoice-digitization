@@ -29,7 +29,7 @@ def test_data_dir(project_root: Path) -> Path:
 @pytest.fixture(autouse=True)
 def reset_singletons():
     """Reset singleton instances between tests."""
-    from src.core.model_manager import ModelManager
+    from invoice_digitizer.core.model_manager import ModelManager
 
     yield
 

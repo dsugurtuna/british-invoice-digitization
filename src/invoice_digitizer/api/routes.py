@@ -13,10 +13,10 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import numpy as np
 from PIL import Image
 
-from src.core.digitizer import InvoiceDigitizer
-from src.schemas.detection import DetectionResult
-from src.schemas.request import BatchProcessRequest, InferenceRequest, ModelConfigRequest
-from src.schemas.response import (
+from invoice_digitizer.core.digitizer import InvoiceDigitizer
+from invoice_digitizer.schemas.detection import DetectionResult
+from invoice_digitizer.schemas.request import BatchProcessRequest, InferenceRequest, ModelConfigRequest
+from invoice_digitizer.schemas.response import (
     APIResponse,
     BatchJobStatus,
     BatchProcessResponse,
@@ -30,7 +30,7 @@ from src.schemas.response import (
 )
 
 if TYPE_CHECKING:
-    from src.config.settings import Settings
+    from invoice_digitizer.config.settings import Settings
 
 logger = structlog.get_logger(__name__)
 

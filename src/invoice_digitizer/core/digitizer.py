@@ -9,14 +9,14 @@ from typing import TYPE_CHECKING, Any
 
 import structlog
 
-from src.core.detector import InvoiceFieldDetector
-from src.schemas.detection import DetectionResult
+from invoice_digitizer.core.detector import InvoiceFieldDetector
+from invoice_digitizer.schemas.detection import DetectionResult
 
 if TYPE_CHECKING:
     import numpy as np
     from numpy.typing import NDArray
 
-    from src.config.settings import Settings
+    from invoice_digitizer.config.settings import Settings
 
 logger = structlog.get_logger(__name__)
 
@@ -55,7 +55,7 @@ class InvoiceDigitizer:
             settings: Application settings. If None, loads from default config.
             max_workers: Maximum concurrent workers for batch processing.
         """
-        from src.config.settings import get_settings
+        from invoice_digitizer.config.settings import get_settings
 
         self._settings = settings or get_settings()
         self._detector = InvoiceFieldDetector(self._settings)

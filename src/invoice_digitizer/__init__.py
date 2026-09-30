@@ -14,16 +14,16 @@ Modules:
     - utils: Utility functions and helpers
 
 Example:
-    >>> from src import InvoiceDigitizer
+    >>> from invoice_digitizer import InvoiceDigitizer
     >>> digitizer = InvoiceDigitizer()
     >>> result = await digitizer.process_invoice("invoice.jpg")
     >>> print(result.detections)
 """
 
-from src.core.digitizer import InvoiceDigitizer
-from src.core.detector import InvoiceFieldDetector
-from src.schemas.detection import DetectionResult, InvoiceField
-from src.config.settings import Settings, get_settings
+from invoice_digitizer.core.digitizer import InvoiceDigitizer
+from invoice_digitizer.core.detector import InvoiceFieldDetector
+from invoice_digitizer.schemas.detection import DetectionResult, InvoiceField
+from invoice_digitizer.config.settings import Settings, get_settings
 
 __all__ = [
     "InvoiceDigitizer",

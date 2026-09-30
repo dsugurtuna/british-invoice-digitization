@@ -10,8 +10,8 @@ from fastapi.testclient import TestClient
 from PIL import Image
 import numpy as np
 
-from src.api.main import create_app
-from src.config.settings import Settings
+from invoice_digitizer.api.main import create_app
+from invoice_digitizer.config.settings import Settings
 
 
 @pytest.fixture
@@ -26,7 +26,7 @@ def settings() -> Settings:
 @pytest.fixture
 def mock_model_manager():
     """Create mock model manager."""
-    with patch("src.api.main.ModelManager") as mock:
+    with patch("invoice_digitizer.api.main.ModelManager") as mock:
         manager = MagicMock()
         manager.model = MagicMock()
         manager.device = "cpu"

@@ -9,7 +9,7 @@ from uuid import UUID, uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from src.schemas.detection import DetectionResult
+from invoice_digitizer.schemas.detection import DetectionResult
 
 T = TypeVar("T")
 

@@ -11,7 +11,7 @@ import structlog
 import torch
 
 if TYPE_CHECKING:
-    from src.config.settings import Settings
+    from invoice_digitizer.config.settings import Settings
 
 logger = structlog.get_logger(__name__)
 
@@ -64,7 +64,7 @@ class ModelManager:
                 return
 
             # Import here to avoid circular imports
-            from src.config.settings import get_settings
+            from invoice_digitizer.config.settings import get_settings
 
             self._settings = settings or get_settings()
             self._model: Any = None

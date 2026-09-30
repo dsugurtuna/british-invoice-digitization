@@ -11,8 +11,8 @@ import numpy as np
 import structlog
 import torch
 
-from src.core.model_manager import ModelManager
-from src.schemas.detection import (
+from invoice_digitizer.core.model_manager import ModelManager
+from invoice_digitizer.schemas.detection import (
     BoundingBox,
     DetectionResult,
     InvoiceField,
@@ -23,7 +23,7 @@ from src.schemas.detection import (
 if TYPE_CHECKING:
     from numpy.typing import NDArray
 
-    from src.config.settings import Settings
+    from invoice_digitizer.config.settings import Settings
 
 logger = structlog.get_logger(__name__)
 
@@ -50,7 +50,7 @@ class InvoiceFieldDetector:
         Args:
             settings: Application settings. If None, loads from default config.
         """
-        from src.config.settings import get_settings
+        from invoice_digitizer.config.settings import get_settings
 
         self._settings = settings or get_settings()
         self._model_manager = ModelManager(self._settings)

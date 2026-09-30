@@ -97,12 +97,8 @@ Repository = "https://github.com/dsugurtuna/british-invoice-digitization.git"
 Issues = "https://github.com/dsugurtuna/british-invoice-digitization/issues"
 Changelog = "https://github.com/dsugurtuna/british-invoice-digitization/blob/main/CHANGELOG.md"
 
-[project.scripts]
-royalaudit = "src.cli:main"
-
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["src*"]
+where = ["src"]
 
 [tool.setuptools.package-data]
 "*" = ["py.typed", "*.yaml", "*.yml", "*.json"]
@@ -182,7 +178,7 @@ ignore = [
 "notebooks/**/*.py" = ["E402", "F401"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["src"]
+known-first-party = ["invoice_digitizer"]
 force-single-line = false
 lines-between-types = 1
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from src.config.settings import (
+from invoice_digitizer.config.settings import (
     DeviceType,
     Environment,
     LogLevel,

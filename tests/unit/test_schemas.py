@@ -7,7 +7,7 @@ from uuid import UUID
 
 import pytest
 
-from src.schemas.detection import (
+from invoice_digitizer.schemas.detection import (
     BoundingBox,
     DetectionResult,
     InvoiceField,
