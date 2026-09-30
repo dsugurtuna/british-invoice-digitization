@@ -138,6 +138,12 @@ def test_missing_weights_fail_loudly_by_default(tmp_path: Path) -> None:
     assert torch.hub_calls == []
 
 
+def test_missing_weights_message_needs_no_torch(tmp_path: Path) -> None:
+    """On a base install (no torch), the user sees the weights message, not an ImportError."""
+    with pytest.raises(FileNotFoundError, match="No trained weights"):
+        load_yolov5(ModelSettings(weights_path=str(tmp_path / "missing.pt")))
+
+
 def test_pretrained_fallback_is_opt_in_and_labelled(tmp_path: Path) -> None:
     torch = FakeTorch(cuda=True)
     settings = ModelSettings(

@@ -157,13 +157,24 @@ def load_yolov5(settings: ModelSettings, torch: Any | None = None) -> LoadedMode
     Raises:
         FileNotFoundError: The weights file is missing and the pretrained fallback is off.
     """
+    weights = Path(settings.weights_path)
+    use_custom = weights.is_file()
+    # Check for weights before importing torch, so a base install without weights gets
+    # this explanation rather than "No module named 'torch'".
+    if not use_custom and not settings.allow_pretrained_fallback:
+        raise FileNotFoundError(
+            f"No trained weights at {weights}. Train them with "
+            "notebooks/01_train_yolov5_invoices.ipynb, or set "
+            "INVOICE_DIGITIZER_MODEL__ALLOW_PRETRAINED_FALLBACK=true to smoke-test the "
+            "service with generic COCO weights (which cannot detect invoice fields)."
+        )
+
     if torch is None:
         import torch as torch_module  # heavy import, only needed when a model loads
 
         torch = torch_module
 
     device = resolve_device(settings.device.value, torch)
-    weights = Path(settings.weights_path)
     # trust_repo=True runs code downloaded from hub_repo. Pinning hub_repo to a release
     # tag (not a branch) keeps that code fixed between runs.
     hub_options: dict[str, Any] = {
@@ -172,11 +183,11 @@ def load_yolov5(settings: ModelSettings, torch: Any | None = None) -> LoadedMode
         "device": device,
     }
 
-    if weights.is_file():
+    if use_custom:
         model = torch.hub.load(settings.hub_repo, "custom", path=str(weights), **hub_options)
         loaded_source = f"custom weights {weights.name}"
         sha = sha256_file(weights)
-    elif settings.allow_pretrained_fallback:
+    else:
         logger.warning(
             "weights_missing_using_pretrained_fallback",
             weights_path=str(weights),
@@ -188,13 +199,6 @@ def load_yolov5(settings: ModelSettings, torch: Any | None = None) -> LoadedMode
         )
         loaded_source = f"pretrained {settings.architecture} (COCO classes)"
         sha = None
-    else:
-        raise FileNotFoundError(
-            f"No trained weights at {weights}. Train them with "
-            "notebooks/01_train_yolov5_invoices.ipynb, or set "
-            "INVOICE_DIGITIZER_MODEL__ALLOW_PRETRAINED_FALLBACK=true to smoke-test the "
-            "service with generic COCO weights (which cannot detect invoice fields)."
-        )
 
     if settings.half_precision and device.startswith("cuda"):
         model.half()
