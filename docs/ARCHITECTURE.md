@@ -1,83 +1,88 @@
-# RoyalAudit Digitizer - System Architecture
+# Architecture
 
-## 1. Overview
+This page describes how the code is put together and how it behaves under concurrency and
+failure. For the reasons behind each choice, see [WHY.md](WHY.md).
 
-The RoyalAudit Digitizer is a high-performance, production-grade system designed to extract structured data from handwritten British invoices. It leverages state-of-the-art Computer Vision (YOLOv5) and modern API standards (FastAPI) to provide a scalable solution for financial auditing.
+## Components
 
-## 2. System Components
+| Module | Responsibility |
+| --- | --- |
+| `api/main.py` | App factory. Builds settings, one `ModelManager` and one `InvoiceDigitizer`, attaches them to `app.state`, adds middleware. The lifespan handler preloads the model. |
+| `api/routes.py` | Endpoints. Validates uploads (type, size, decodability) before any model work. Admin endpoints depend on `require_admin`. |
+| `api/middleware.py` | Request ID, timing, logging and Prometheus metrics; in-memory rate limit. |
+| `config/settings.py` | Settings from init arguments, then `INVOICE_DIGITIZER_*` environment variables, then an optional YAML file. |
+| `core/images.py` | Decodes files, uploads and arrays to RGB `uint8`, applies EXIF orientation, enforces size limits. |
+| `core/yolov5_backend.py` | The only module that imports PyTorch. Loads YOLOv5 through `torch.hub` from a pinned tag and adapts its output to `RawDetection`. |
+| `core/model_manager.py` | Owns the loaded model for the process: lazy load, locking, reload, thresholds. |
+| `core/detector.py` | Maps raw boxes to `InvoiceField`s (labels, clipping, ignored count) and draws annotated images. |
+| `core/digitizer.py` | Sync, async and batch entry points; a thread pool for async calls. |
+| `schemas/` | Pydantic models for results, requests and responses. |
 
-### 2.1 Core Application (`src/core`)
-- **Model Manager**: Thread-safe singleton that handles model loading, caching, and inference. Supports lazy loading to optimize startup time.
-- **Detector**: Wrapper around the YOLOv5 model that handles image preprocessing (resizing, normalization) and post-processing (NMS, coordinate scaling).
-- **Digitizer**: High-level orchestrator that manages batch processing using `ThreadPoolExecutor` for concurrent inference.
+## Request flow
 
-### 2.2 API Layer (`src/api`)
-- **FastAPI**: Provides a high-performance, async REST API.
-- **Endpoints**:
-  - `POST /detect`: Single image inference.
-  - `POST /batch`: Batch image inference.
-  - `GET /health`: System health checks (liveness/readiness).
-  - `GET /model/info`: Model metadata and status.
-- **Middleware**:
-  - Request logging with correlation IDs.
-  - Rate limiting to prevent abuse.
-  - CORS configuration for frontend integration.
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Route as routes.py
+    participant Dig as InvoiceDigitizer
+    participant Det as InvoiceFieldDetector
+    participant MM as ModelManager
+    participant Model as YOLOv5 (torch.hub)
+    Client->>Route: POST /api/v1/inference (image)
+    Route->>Route: check type, size; decode to RGB
+    Route->>Dig: process_async(image, overrides)
+    Dig->>Det: detect() in a worker thread
+    Det->>MM: predict(image, confidence, iou)
+    MM->>MM: load once (lock), then take predict lock
+    MM->>Model: set thresholds, run
+    Model-->>MM: raw boxes
+    MM-->>Det: raw boxes + model identity
+    Det->>Det: map labels, clip, count ignored, sort
+    Det-->>Route: DetectionResult
+    Route-->>Client: 200 JSON (or 4xx/5xx with a reason)
+```
 
-### 2.3 Data Models (`src/schemas`)
-- **Pydantic v2**: Used for strict data validation and serialization.
-- **Schemas**:
-  - `DetectionResult`: Standardized bounding box and class info.
-  - `InvoiceField`: Domain-specific field representation.
-  - `ProcessingRequest`: API request validation.
-  - `APIResponse`: Uniform response structure.
+## Concurrency
 
-### 2.4 Infrastructure
-- **Docker**: Multi-stage builds for optimized production images.
-  - `builder`: Compiles dependencies.
-  - `runtime`: Minimal footprint image (distroless/slim).
-- **Docker Compose**: Orchestrates the API, Redis (optional cache), and Prometheus (monitoring).
-- **GitHub Actions**: CI/CD pipeline for testing, linting, and security scanning.
+- **Loading.** `ModelManager.load()` takes a lock, so many threads arriving at a cold process
+  cause one load.
+- **Inference.** `ModelManager.predict()` holds a second lock for the whole call. The YOLOv5
+  wrapper reads its thresholds from attributes on the model, so overlapping calls would race.
+  Throughput is therefore one image at a time per process. The thread pool in
+  `InvoiceDigitizer` keeps the event loop free and lets decoding overlap with inference; it
+  does not run the model in parallel.
+- **Reload.** The new model loads while the old one keeps serving. The reference is swapped only
+  on success. A failed reload leaves the old model in place and returns `500`.
+- **Scaling.** Run more processes or containers. Each loads its own copy of the model and has
+  its own thresholds and rate-limit counters.
 
-## 3. Data Flow
+## Failure behaviour
 
-1.  **Request**: Client sends an image (or batch) to the API.
-2.  **Validation**: Pydantic schemas validate the input payload.
-3.  **Preprocessing**: Image is resized to 640x640 and normalized.
-4.  **Inference**: YOLOv5 model predicts bounding boxes and classes.
-5.  **Post-processing**: Non-Maximum Suppression (NMS) filters overlapping boxes.
-6.  **Formatting**: Results are mapped to `InvoiceField` objects.
-7.  **Response**: JSON response is returned to the client.
+| Situation | Behaviour |
+| --- | --- |
+| No weights, preload on (default) | Start-up fails with a message naming the path and the notebook. |
+| No weights, preload off | Server starts; `/health` is `degraded`, `/health/ready` is `503`, inference is `503` with the same message. |
+| Wrong file type / too large / not decodable | `415` / `413` / `400`, before any model work. |
+| Model raises during inference | `500` with the request ID; the exception text stays in the server log. |
+| One bad file in a batch | Listed in `errors`; other files still processed; `job_status` is `partial`. |
+| Model returns classes that are not invoice fields | Dropped and counted in `ignored_detections`. |
+| Admin endpoint without a configured key | `403`: admin endpoints are off. Wrong or missing key: `401`. |
 
-## 4. Technology Stack
+## Observability
 
-- **Language**: Python 3.11
-- **Framework**: FastAPI
-- **ML Engine**: PyTorch, YOLOv5 (v7.0)
-- **Validation**: Pydantic v2
-- **Containerization**: Docker
-- **CI/CD**: GitHub Actions
-- **Testing**: Pytest, Coverage
+- Each response carries `X-Request-ID` (matching `request_id` in the body) and `X-Process-Time`.
+- Log lines record method, route template, status and duration. They do not record file
+  names or client addresses.
+- `/metrics` exposes `http_requests_total`, `http_request_duration_seconds`,
+  `inference_images_total{outcome}` and `inference_duration_seconds`, labelled by route
+  template so label cardinality stays bounded.
+- With `environment=production`, logs are JSON lines.
 
-## 5. Security & Performance
+## Security notes
 
-- **Non-root User**: Docker container runs as a non-privileged user.
-- **Health Checks**: Integrated health endpoints for orchestrators (K8s/Swarm).
-- **Concurrency**: Async API with thread pool for CPU-bound ML tasks.
-- **Type Safety**: 100% type-annotated codebase checked with MyPy.
-*   **Pattern:** Singleton-like instantiation of the YOLOv5 model to minimize VRAM overhead.
-*   **Optimization:** Uses `torch.hub` for model loading with FP16 (half-precision) inference capabilities enabled when CUDA is detected.
-*   **Scalability:** Designed to be stateless. Multiple instances can be spun up behind a load balancer (e.g., NGINX) to handle high throughput.
-
-### 2.2 Data Pipeline
-*   **Augmentation:** To handle the variability of historical British documents (faded ink, coffee stains, folds), we employ a rigorous augmentation pipeline:
-    *   Mosaic Augmentation (combining 4 images)
-    *   HSV Color Space manipulation
-    *   Random affine transformations (rotation, scaling)
-
-## 3. Security & Compliance
-*   **Data Privacy:** No PII is logged in the application logs.
-*   **Audit Trails:** All inference requests are timestamped and tagged with a unique request ID.
-
-## 4. Future Roadmap
-*   **Phase 2:** Integration of LayoutLMv3 for multimodal (text + image) understanding.
-*   **Phase 3:** Real-time edge deployment on mobile devices for field auditors.
+- Default bind address is `127.0.0.1`; the container sets `0.0.0.0` explicitly.
+- CORS is off unless origins are configured.
+- Admin endpoints use a constant-time key comparison and are disabled without a key.
+- Inference endpoints are unauthenticated; put a gateway in front for anything shared.
+- `torch.hub.load(..., trust_repo=True)` downloads and executes YOLOv5 code from GitHub on first
+  load, and YOLOv5 checkpoints are Python pickles. Pin the tag, and load only weights you trust.
